@@ -21,7 +21,7 @@
 
 ]]
 
-if not ... then require'lrucachelow_test'; return end
+if not ... then require'lrucache_test'; return end
 
 local linkedlist = require'linkedlist'
 

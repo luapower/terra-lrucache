@@ -1,6 +1,6 @@
 
 setfenv(1, require'low')
-local cache = require'lrucachelow'
+local cache = require'lrucache'
 
 local S = struct { x: int }
 
