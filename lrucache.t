@@ -25,13 +25,17 @@ if not ... then require'lrucache_test'; return end
 
 local linkedlist = require'linkedlist'
 
-local function cache_type(key_t, val_t, size_t, C)
+local function cache_type(key_t, val_t, hash, size_t, C)
 
 	setfenv(1, C)
 
-	local values_list = linkedlist{T = val_t, C = C}
-	local indices_map = map{key_t = key_t, val_t = size_t, C = C}
-	local keys_map = map{key_t = size_t, val_t = key_t, C = C}
+	local values_list = linkedlist {T = val_t, C = C}
+	local indices_map = map {key_t = key_t, val_t = size_t, hash = hash, C = C}
+	local keys_map = map {key_t = size_t, val_t = key_t, C = C}
+
+	local memsize = val_t:isstruct() and val_t.methods.__size
+		or macro(function() return sizeof(val_t) end)
+	local free = val_t:isstruct() and val_t.methods.free or noop
 
 	local struct cache {
 		max_size: size_t;
@@ -88,11 +92,12 @@ local function cache_type(key_t, val_t, size_t, C)
 
 	terra cache:_remove_at(i: size_t)
 		var v = self.lru:at(i)
-		var v_size = v:lrucache_size()
+		var v_size: size_t = memsize(v)
 		self.lru:remove(i)
 		var ki = self.keys:get_index(i)
 		assert(self.indices:del(self.keys:val_at(ki)))
 		assert(self.keys:del_at(ki))
+		free(v)
 		self.size = self.size - v_size
 		self.count = self.count - 1
 	end
@@ -107,7 +112,7 @@ local function cache_type(key_t, val_t, size_t, C)
 	end
 
 	terra cache:put(k: key_t, v: val_t)
-		var v_size: size_t = v:lrucache_size()
+		var v_size: size_t = memsize(&v)
 		self:shrink(self.max_size - v_size, self.max_count - 1)
 		var i = self.lru:insert_first(v)
 		if i == -1 then return false end
@@ -124,14 +129,15 @@ local function cache_type(key_t, val_t, size_t, C)
 end
 cache_type = terralib.memoize(cache_type)
 
-local cache_type = function(key_t, val_t, size_t, C)
+local cache_type = function(key_t, val_t, hash, size_t, C)
 	if terralib.type(key_t) == 'table' then
 		local t = key_t
-		key_t, val_t, size_t, C = t.key_t, t.val_t, t.size_t, t.C
+		key_t, val_t, hash, size_t, C =
+			t.key_t, t.val_t, t.hash, t.size_t, t.C
 	end
 	size_t = size_t or int
 	C = C or require'low'
-	return cache_type(key_t, val_t, size_t, C)
+	return cache_type(key_t, val_t, hash, size_t, C)
 end
 
 local cache_type = macro(

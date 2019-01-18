@@ -4,7 +4,7 @@ local cache = require'lrucache'
 
 local S = struct { x: int }
 
-terra S:lrucache_size()
+S.metamethods.__memsize = terra(self: &S)
 	return 100
 end
 
@@ -20,3 +20,7 @@ terra test()
 	print(cache:get(5), cache:get(7), cache:get(3))
 end
 test()
+
+--f = terra() end
+--terra f() end
+--terra f() end
