@@ -11,6 +11,7 @@
 	c:free()
 	c:clear()
 	c:preallocate(size) -> ok?
+	c:shrink(max_size, max_count)
 	c.max_size
 	c.max_count
 	c.size
@@ -25,51 +26,90 @@ if not ... then require'lrucache_test'; return end
 
 local linkedlist = require'linkedlist'
 
-local function cache_type(key_t, val_t, hash, size_t, C)
+local function memsize_func(T)
+	return T:isstruct() and T.methods.__memsize
+		or macro(function() return sizeof(T) end)
+end
+
+local function cache_type(key_t, val_t, hash, equal, size_t, C)
 
 	setfenv(1, C)
 
-	local values_list = linkedlist {T = val_t, C = C}
-	local indices_map = map {key_t = key_t, val_t = size_t, hash = hash, C = C}
-	local keys_map = map {key_t = size_t, val_t = key_t, C = C}
+	val_t = val_t or bool --TODO: make val_t truly optional.
 
-	local memsize = val_t:isstruct() and val_t.methods.__size
-		or macro(function() return sizeof(val_t) end)
-	local free = val_t:isstruct() and val_t.methods.free or noop
+	local struct pair_t {
+		key: key_t;
+		val: val_t;
+	}
+
+	local pair_list = linkedlist {T = pair_t, C = C}
+
+	--TODO: wrap the cache struct in an opaque struct so that we can make
+	--indices.userdata = &self.lru and use that instead of this brittle hack.
+	local deref = macro(function(self, pi)
+		return `&(([&pair_list](([&int8](self))-sizeof(pair_list))):at(@pi).key)
+	end)
+
+	local indices_set = map {
+		key_t = size_t, deref = deref, deref_key_t = key_t,
+		hash = hash, equal = equal, C = C
+	}
 
 	local struct cache {
 		max_size: size_t;
 		max_count: size_t;
 		size: size_t;
 		count: size_t;
-		lru: values_list;      --{i -> v}
-		indices: indices_map;  --{k -> i}
-		keys: keys_map;        --{i -> k}
+		lru: pair_list;        --{{key=k, val=v}, ...}
+		indices: indices_set;  --{k/i}
 	}
 
-	--memory management
+	--key/value pair interface
+	local key_memsize = memsize_func(key_t)
+	local val_memsize = memsize_func(val_t)
+	local pair_memsize = macro(function(k, v)
+		local fixed_size = sizeof(&key_t) + 2 * sizeof(size_t)
+		return `key_memsize(k) + val_memsize(v) + fixed_size
+	end)
+
+	local free_key = key_t:isstruct() and key_t.methods.free or noop
+	local free_val = val_t:isstruct() and val_t.methods.free or noop
+
+	local free_pairs = macro(function(self, k, v)
+		if free_key == noop and free_val == noop then
+			return quote end
+		end
+		return quote
+			for e in self.lru do
+				free_key(&e.key)
+				free_val(&e.val)
+			end
+		end
+	end)
+
+	--storage
 
 	function cache.metamethods.__cast(from, to, exp)
 		if from == niltype or from:isunit() then
 			return `cache {max_size=0, max_count=[size_t:max()], size=0,
-				lru=nil, indices=nil, keys=nil}
+					lru=nil, indices=nil}
 		else
 			error'invalid cast'
 		end
 	end
 
 	terra cache:free() --can be reused after free
+		free_pairs(self)
 		self.lru:free()
 		self.indices:free()
-		self.keys:clear()
 		self.size = 0
 		self.count = 0
 	end
 
 	terra cache:clear()
+		free_pairs(self)
 		self.lru:clear()
 		self.indices:clear()
-		self.keys:clear()
 		self.size = 0
 		self.count = 0
 	end
@@ -77,28 +117,33 @@ local function cache_type(key_t, val_t, hash, size_t, C)
 	terra cache:preallocate(count: size_t)
 		self.lru:preallocate(count)
 		self.indices:preallocate(count)
-		self.keys:preallocate(count)
+	end
+
+	terra cache:__memsize()
+		return sizeof(cache)
+			+ self.lru:__memsize()
+			+ self.indices:__memsize()
 	end
 
 	--operation
 
-	terra cache:get(key: key_t): &val_t
-		var i = self.indices(key, -1)
-		if i == -1 then return nil end
-		var v = self.lru:at(i)
+	terra cache:get(k: key_t): &pair_t
+		var ki = self.indices:get_index(k)
+		if ki == -1 then return nil end
+		var i = self.indices:noderef_key_at_index(ki)
+		var pair = self.lru:at(i)
 		self.lru:make_first(i)
-		return v
+		return pair
 	end
 
 	terra cache:_remove_at(i: size_t)
-		var v = self.lru:at(i)
-		var v_size: size_t = memsize(v)
+		var pair = self.lru:at(i)
+		var pair_size: size_t = pair_memsize(&pair.key, &pair.val)
+		free_key(&pair.key)
+		free_val(&pair.val)
 		self.lru:remove(i)
-		var ki = self.keys:get_index(i)
-		assert(self.indices:del(self.keys:val_at(ki)))
-		assert(self.keys:del_at(ki))
-		free(v)
-		self.size = self.size - v_size
+		assert(self.indices:del(pair.key))
+		self.size = self.size - pair_size
 		self.count = self.count - 1
 	end
 
@@ -112,16 +157,26 @@ local function cache_type(key_t, val_t, hash, size_t, C)
 	end
 
 	terra cache:put(k: key_t, v: val_t)
-		var v_size: size_t = memsize(&v)
-		self:shrink(self.max_size - v_size, self.max_count - 1)
-		var i = self.lru:insert_first(v)
-		if i == -1 then return false end
-		var ii = self.indices:putifnew(k, i) --fails if the key is present!
-		if ii == -1 then self.lru:remove(i); return false end
-		var ki = self.keys:put(i, k)
-		if ki == -1 then self.lru:remove(i); self.indices:del_at(ii); return false end
-		self.size = self.size + v_size
+		var pair_size: size_t = pair_memsize(&k, &v)
+		self:shrink(self.max_size - pair_size, self.max_count - 1)
+		var i = self.lru:insert_first()
+		if i == -1 then return nil end
+		var p = self.lru:at(i)
+		assert(p ~= nil)
+		p.key, p.val = k, v
+		var ret = self.indices:putifnew(i, true) --fails if the key is present!
+		if ret == -1 then self.lru:remove(i); return nil end
+		self.size = self.size + pair_size
 		self.count = self.count + 1
+		return p
+	end
+
+	terra cache:remove(k: key_t): bool
+		var ki = self.indices:get_index(k)
+		if ki == -1 then return false end
+		var i = self.indices:noderef_key_at_index(ki)
+		self.lru:remove(i)
+		self.indices:del_at_index(ki)
 		return true
 	end
 
@@ -129,7 +184,7 @@ local function cache_type(key_t, val_t, hash, size_t, C)
 end
 cache_type = terralib.memoize(cache_type)
 
-local cache_type = function(key_t, val_t, hash, size_t, C)
+local cache_type = function(key_t, val_t, hash, equal, size_t, C)
 	if terralib.type(key_t) == 'table' then
 		local t = key_t
 		key_t, val_t, hash, size_t, C =
@@ -137,7 +192,7 @@ local cache_type = function(key_t, val_t, hash, size_t, C)
 	end
 	size_t = size_t or int
 	C = C or require'low'
-	return cache_type(key_t, val_t, hash, size_t, C)
+	return cache_type(key_t, val_t, hash, equal, size_t, C)
 end
 
 local cache_type = macro(
