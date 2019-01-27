@@ -89,10 +89,16 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 
 	--storage
 
+	terra cache:init()
+		fill(self)
+		self.max_count = [size_t:max()]
+		self.lru:init()
+		self.indices:init()
+	end
+
 	function cache.metamethods.__cast(from, to, exp)
 		if from == niltype or from:isunit() then
-			return `cache {max_size=0, max_count=[size_t:max()], size=0,
-					lru=nil, indices=nil}
+			return quote var c: cache; c:init() in c end
 		else
 			error'invalid cast'
 		end
