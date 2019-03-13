@@ -4,36 +4,35 @@
 
 --[[  API
 
-	local C = cache{key_t=, val_t=, size_t=int, C=require'low'}
-	var c = cache(key_t, val_t, size_t=int) -- preferred variant
-	var c: C = nil   -- =nil is important!
-	var c = C(nil)   -- (nil) is important!
-	c:free()
-	c:clear()
-	c:preallocate(size) -> ok?
-	c:shrink(max_size, max_count)
-	c.max_size
-	c.max_count
-	c.size
-	c.count
+	local C = cache{key_t=,val_t=,size_t=int} create type from Lua
+	var c = cache(key_t,val_t,[size_t=int])   create value from Terra
+	var c = C(nil)                            nil-cast (for use in constant())
+	c:init()                                  initialize (for struct members)
+	c:free()                                  free
+	c:clear()                                 clear (but preserve memory)
+	c.min_capacity = n                        (write/only) preallocate a number of items
+	c:shrink(max_size, max_count)             shrink (but don't free memory)
+	c.max_size                                (read/write) max bytesize
+	c.max_count                               (read/write) max number of items
+	c.size                                    (read/only) current size
+	c.count                                   (read/only) current number of items
 
-	c:get(k) -> &v|nil
-	c:put(k, v) -> ok?
+	c:get(k) -> &v|nil                        get value
+	c:put(k, v) -> pair|nil                   put value (nil if value > max_size)
 
 ]]
 
 if not ... then require'lrucache_test'; return end
 
 local linkedlist = require'linkedlist'
+setfenv(1, require'low')
 
 local function memsize_func(T)
 	return T:isstruct() and T.methods.__memsize
 		or macro(function() return sizeof(T) end)
 end
 
-local function cache_type(key_t, val_t, hash, equal, size_t, C)
-
-	setfenv(1, C)
+local function cache_type(key_t, val_t, hash, equal, size_t)
 
 	val_t = val_t or bool --TODO: make val_t truly optional.
 
@@ -42,7 +41,7 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 		val: val_t;
 	}
 
-	local pair_list = linkedlist {T = pair_t, C = C}
+	local pair_list = linkedlist {T = pair_t}
 
 	--TODO: wrap the cache struct in an opaque struct so that we can make
 	--indices.userdata = &self.lru and use that instead of this brittle hack.
@@ -52,10 +51,10 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 
 	local indices_set = map {
 		key_t = size_t, deref = deref, deref_key_t = key_t,
-		hash = hash, equal = equal, C = C
+		hash = hash, equal = equal
 	}
 
-	local struct cache {
+	local struct cache (gettersandsetters) {
 		max_size: size_t;
 		max_count: size_t;
 		size: size_t;
@@ -69,11 +68,11 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 	local val_memsize = memsize_func(val_t)
 	local pair_memsize = macro(function(k, v)
 		local fixed_size = sizeof(&key_t) + 2 * sizeof(size_t)
-		return `key_memsize(k) + val_memsize(v) + fixed_size
+		return `[size_t](key_memsize(k) + val_memsize(v) + fixed_size)
 	end)
 
-	local free_key = key_t:isstruct() and key_t.methods.free or noop
-	local free_val = val_t:isstruct() and val_t.methods.free or noop
+	local free_key = key_t:isstruct() and key_t:getmethod'free' or noop
+	local free_val = val_t:isstruct() and val_t:getmethod'free' or noop
 
 	local free_pairs = macro(function(self, k, v)
 		if free_key == noop and free_val == noop then
@@ -120,9 +119,9 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 		self.count = 0
 	end
 
-	terra cache:preallocate(count: size_t)
-		self.lru:preallocate(count)
-		self.indices:preallocate(count)
+	terra cache:set_min_capacity(n: size_t)
+		self.lru.min_capacity = n
+		self.indices:preallocate(n)
 	end
 
 	terra cache:__memsize()
@@ -135,6 +134,7 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 
 	terra cache:get(k: key_t): &pair_t
 		var ki = self.indices:get_index(k)
+		print(k, ki)
 		if ki == -1 then return nil end
 		var i = self.indices:noderef_key_at_index(ki)
 		var pair = self.lru:at(i)
@@ -144,11 +144,11 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 
 	terra cache:_remove_at(i: size_t)
 		var pair = self.lru:at(i)
-		var pair_size: size_t = pair_memsize(&pair.key, &pair.val)
-		free_key(&pair.key)
-		free_val(&pair.val)
+		var pair_size = pair_memsize(&pair.key, &pair.val)
 		self.lru:remove(i)
 		assert(self.indices:del(pair.key))
+		free_key(&pair.key)
+		free_val(&pair.val)
 		self.size = self.size - pair_size
 		self.count = self.count - 1
 	end
@@ -163,8 +163,10 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 	end
 
 	terra cache:put(k: key_t, v: val_t)
-		var pair_size: size_t = pair_memsize(&k, &v)
-		self:shrink(self.max_size - pair_size, self.max_count - 1)
+		var pair_size = pair_memsize(&k, &v)
+		if not self:shrink(self.max_size - pair_size, self.max_count - 1) then
+			return nil
+		end
 		var i = self.lru:insert_first()
 		if i == -1 then return nil end
 		var p = self.lru:at(i)
@@ -190,15 +192,14 @@ local function cache_type(key_t, val_t, hash, equal, size_t, C)
 end
 cache_type = terralib.memoize(cache_type)
 
-local cache_type = function(key_t, val_t, hash, equal, size_t, C)
+local cache_type = function(key_t, val_t, hash, equal, size_t)
 	if terralib.type(key_t) == 'table' then
 		local t = key_t
-		key_t, val_t, hash, size_t, C =
-			t.key_t, t.val_t, t.hash, t.size_t, t.C
+		key_t, val_t, hash, size_t =
+			t.key_t, t.val_t, t.hash, t.size_t
 	end
 	size_t = size_t or int
-	C = C or require'low'
-	return cache_type(key_t, val_t, hash, equal, size_t, C)
+	return cache_type(key_t, val_t, hash, equal, size_t)
 end
 
 local cache_type = macro(
