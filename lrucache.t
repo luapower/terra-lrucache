@@ -171,7 +171,7 @@ local function cache_type(key_t, val_t, hash, equal, size_t)
 		var p = self.lru:at(i)
 		assert(p ~= nil)
 		p.key, p.val = k, v
-		var ret = self.indices:putifnew(i) --fails if the key is present!
+		var ret = self.indices:add(i) --fails if the key is present!
 		if ret == -1 then self.lru:remove(i); return nil end
 		self.size = self.size + pair_size
 		self.count = self.count + 1
