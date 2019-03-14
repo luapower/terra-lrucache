@@ -121,7 +121,7 @@ local function cache_type(key_t, val_t, hash, equal, size_t)
 
 	terra cache:set_min_capacity(n: size_t)
 		self.lru.min_capacity = n
-		self.indices:preallocate(n)
+		self.indices.min_capacity = n
 	end
 
 	terra cache:__memsize()
@@ -133,8 +133,7 @@ local function cache_type(key_t, val_t, hash, equal, size_t)
 	--operation
 
 	terra cache:get(k: key_t): &pair_t
-		var ki = self.indices:get_index(k)
-		print(k, ki)
+		var ki = self.indices:index(k, -1)
 		if ki == -1 then return nil end
 		var i = self.indices:noderef_key_at_index(ki)
 		var pair = self.lru:at(i)
@@ -172,7 +171,7 @@ local function cache_type(key_t, val_t, hash, equal, size_t)
 		var p = self.lru:at(i)
 		assert(p ~= nil)
 		p.key, p.val = k, v
-		var ret = self.indices:putifnew(i, true) --fails if the key is present!
+		var ret = self.indices:putifnew(i) --fails if the key is present!
 		if ret == -1 then self.lru:remove(i); return nil end
 		self.size = self.size + pair_size
 		self.count = self.count + 1
@@ -180,7 +179,7 @@ local function cache_type(key_t, val_t, hash, equal, size_t)
 	end
 
 	terra cache:remove(k: key_t): bool
-		var ki = self.indices:get_index(k)
+		var ki = self.indices:index(k, -1)
 		if ki == -1 then return false end
 		var i = self.indices:noderef_key_at_index(ki)
 		self.lru:remove(i)
