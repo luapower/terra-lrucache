@@ -25,7 +25,7 @@
 if not ... then require'lrucache_test'; return end
 
 setfenv(1, require'low')
-local linkedlist = require'linkedlist'
+require'linkedlist'
 
 local function cache_type(key_t, val_t, size_t, hash, equal)
 
@@ -36,7 +36,7 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 		val: val_t;
 	}
 
-	local pair_list = linkedlist{T = pair}
+	local pair_list = arraylinkedlist{T = pair}
 
 	local deref = macro(function(self, i)
 		return `&self.state:link(@i).item.key
@@ -129,7 +129,7 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 		var ki = self.indices:index(k, -1)
 		if ki == -1 then return nil end
 		var i = self.indices:noderef_key_at_index(ki)
-		--self.lru:move_before(self.lru.first, i)
+		self.lru:move_before(self.lru.first, i)
 		return &self.lru:link(i).item
 	end
 
@@ -184,7 +184,7 @@ local cache_type = function(key_t, val_t, size_t)
 	return cache_type(key_t, val_t, size_t, hash, equal)
 end
 
-local cache_type = macro(
+low.lrucache = macro(
 	--calling it from Terra returns a new cache object.
 	function(key_t, val_t, size_t)
 		local cache_type = cache_type(key_t, val_t, size_t)
@@ -194,5 +194,3 @@ local cache_type = macro(
 	--just the type, and you can also pass a custom C namespace.
 	cache_type
 )
-
-return cache_type

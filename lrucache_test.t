@@ -1,7 +1,7 @@
 
 --NOASSERTS=1
 setfenv(1, require'low')
-local cache = require'lrucache'
+require'lrucache'
 
 local S = struct {
 	size: intptr;
@@ -11,7 +11,7 @@ terra S:__memsize()
 	return sizeof(@self) + self.size
 end
 
-local cache = cache{key_t = int, val_t = S}
+local cache = lrucache{key_t = int, val_t = S}
 local terra test(key_range: double, probes: double)
 	var cache: cache; cache:init()
 	cache.max_size = 10000
