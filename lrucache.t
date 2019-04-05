@@ -3,7 +3,11 @@
 	LRU cache for Terra, size-limited and count-limited.
 	Written by Cosmin Apreutesei. Public Domain.
 
-	Breaks if trying to put a key/val pair whose memsize is > max_size.
+	* Pair pointers are not valid between put() calls, use indices!
+	* Breaks if trying to put a key that's already in the cache.
+	* Cache items are ref-counted, get() and put() both increase the refcount
+	and forget() decreases it. Ref'ed items never get removed from the cache,
+	instead the cache grows beyond max_size and/or max_count.
 
 	local C = cache{key_t=,val_t=,size_t=int} create type from Lua
 	var c = cache(key_t,val_t,[size_t=int])   create value from Terra
@@ -17,8 +21,10 @@
 	c.size                                    (read/only) current size
 	c.count                                   (read/only) current number of items
 
-	c:get(k) -> &v|nil                        get value
-	c:put(k, v) -> pair|nil                   put value (nil if value > max_size)
+	c:get(k) -> i,&val | -1,nil               get k/v pair by key
+	c:put(k,v) -> i,&val                      put k/v pair
+	c:pair(i) -> &pair                        lookup pair
+	c:forget(i)                               forget pair
 
 ]]
 
@@ -34,7 +40,15 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 	local struct pair {
 		key: key_t;
 		val: val_t;
+		refcount: size_t;
 	}
+
+	if cancall(key_t, 'free') or cancall(val_t, 'free') then
+		terra pair:free()
+			call(self.key, 'free')
+			call(self.val, 'free')
+		end
+	end
 
 	local pair_list = arraylinkedlist{T = pair}
 
@@ -54,8 +68,9 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 		max_count: size_t;
 		size: size_t;
 		count: size_t;
-		lru: pair_list;       --linked list of key/val pairs
+		pairs: pair_list; --linked list of key/val pairs
 		indices: indices_set; --set of indices hashed by key_t through deref().
+		first_active_index: size_t; --first pair that got refcount > 0.
 	}
 
 	cache.key_t = key_t
@@ -63,8 +78,7 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 	cache.size_t = size_t
 
 	local pair_memsize = macro(function(k, v)
-		return `memsize(k) + memsize(v)
-			+ sizeof(pair_list.link) - sizeof(key_t) - sizeof(val_t)
+		return `sizeof(pair) + sizeof(size_t) + memsize(k) + memsize(v)
 	end)
 
 	--storage
@@ -72,77 +86,73 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 	terra cache:init()
 		fill(self)
 		self.max_count = [size_t:max()]
-		self.lru:init()
+		self.pairs:init()
 		self.indices:init()
-		self.indices.state = &self.lru
+		self.indices.state = &self.pairs
+		self.indices.noown_keys = true
+		self.first_active_index = -1
 	end
 
-	cache.methods._free_pairs = macro(function(self)
-		if getmethod(key_t, 'free') or getmethod(val_t, 'free') then
-			return quote
-				for i,link in self.lru do
-					call(link.item.key, 'free')
-					call(link.item.val, 'free')
-				end
-			end
-		else
-			return quote end
-		end
-	end)
-
 	terra cache:clear()
-		self:_free_pairs()
-		self.lru:clear()
+		self.pairs:clear()
 		self.indices:clear()
 		self.size = 0
 		self.count = 0
+		self.first_active_index = -1
 	end
 
 	terra cache:free()
 		self:clear()
-		self.lru:free()
+		self.pairs:free()
 		self.indices:free()
 	end
 
 	terra cache:setcapacity(n: size_t)
-		return self.lru:setcapacity(n)
+		return self.pairs:setcapacity(n)
 			and self.indices:resize(n)
 	end
 	terra cache:set_capacity(n: size_t)
-		self.lru.capacity = n
+		self.pairs.capacity = n
 		self.indices.capacity = n
 	end
 	terra cache:set_min_capacity(n: size_t)
-		self.lru.min_capacity = n
+		self.pairs.min_capacity = n
 		self.indices.min_capacity = n
-	end
-
-	terra cache:__memsize()
-		return sizeof(cache)
-			- sizeof(self.lru) + memsize(self.lru)
-			- sizeof(self.indices) + memsize(self.indices)
 	end
 
 	--operation
 
+	cache.methods.pair = macro(function(self, i)
+		return `&self.pairs:link(i).item
+	end)
+
 	terra cache:get(k: key_t)
 		var ki = self.indices:index(k, -1)
-		if ki == -1 then return nil end
-		var i = self.indices:noderef_key_at_index(ki)
-		self.lru:move_before(self.lru.first, i)
-		return &self.lru:link(i).item
+		if ki ~= -1 then
+			var i = self.indices:noderef_key_at_index(ki)
+			self.pairs:move_before(self.pairs.first, i)
+			var item = &self.pairs:link(i).item
+			inc(item.refcount)
+			if self.first_active_index == -1 then
+				self.first_active_index = i
+			end
+			return i, item
+		else
+			return -1, nil
+		end
 	end
 
 	terra cache:shrink(max_size: size_t, max_count: size_t)
 		while self.size > max_size or self.count > max_count do
-			var i = self.lru.last
-			assert(i ~= -1) --if it's empty we shouldn't be here
-			var pair = self.lru:link(i).item
+			var i = self.pairs.last
+			if i == -1 then break end --cache empty
+			var pair = &self.pairs:link(i).item
+			if pair.refcount > 0 then break end --can't shrink beyond this point
 			var pair_size = pair_memsize(pair.key, pair.val)
-			assert(self.indices:del(pair.key))
+			assert(self.indices:remove(pair.key))
 			call(pair.key, 'free')
 			call(pair.val, 'free')
-			self.lru:remove(i)
+			self.pairs:remove(i)
 			self.size = self.size - pair_size
 			self.count = self.count - 1
 		end
@@ -151,22 +161,30 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 	terra cache:put(k: key_t, v: val_t)
 		var pair_size = pair_memsize(k, v)
 		self:shrink(self.max_size - pair_size, self.max_count - 1)
-		var i, link = self.lru:insert_before(self.lru.first)
+		var i, link = self.pairs:insert_before(self.pairs.first)
 		link.item.key = k
 		link.item.val = v
+		link.item.refcount = 1
 		assert(self.indices:add(i) ~= -1) --fails if the key is present!
 		self.size = self.size + pair_size
 		self.count = self.count + 1
-		return &link.item
+		if self.first_active_index == -1 then
+			self.first_active_index = i
+		end
+		return i, &link.item
 	end
 
-	terra cache:remove(k: key_t): bool
-		var ki = self.indices:index(k, -1)
-		if ki == -1 then return false end
-		var i = self.indices:noderef_key_at_index(ki)
-		self.lru:remove(i)
-		self.indices:del_at_index(ki)
-		return true
+	terra cache:forget(i: size_t)
+		var pair = &self.pairs:link(i).item
+		assert(pair.refcount > 0)
+		dec(pair.refcount)
+		if pair.refcount == 0 and self.first_active_index ~= -1 then
+			if self.first_active_index == i then
+				self.first_active_index = -1
+			else
+				self.pairs:move_after(self.first_active_index, i)
+			end
+		end
 	end
 
 	return cache

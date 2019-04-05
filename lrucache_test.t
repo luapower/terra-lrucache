@@ -8,7 +8,7 @@ local S = struct {
 }
 
 terra S:__memsize()
-	return sizeof(@self) + self.size
+	return self.size
 end
 
 local cache = lrucache{key_t = int, val_t = S}
@@ -19,12 +19,13 @@ local terra test(key_range: double, probes: double)
 	var misses = 0
 	for i = 1, [int64](probes) do
 		var key = random(key_range)
-		var val = cache:get(key)
-		if val == nil then
+		var pair_i, val = cache:get(key)
+		if pair_i == -1 then
 			inc(misses)
 			var val = S{size = random(1000)}
-			cache:put(key, val)
+			pair_i = cache:put(key, val)._0
 		end
+		cache:forget(pair_i)
 	end
 	pfn('%6.2f Mprobes/s, hit rate: %6.2f%%',
 		[double](probes) / (clock() - t0) / 1000 / 1000,
