@@ -9,7 +9,7 @@
 	and forget() decreases it. Ref'ed items never get removed from the cache,
 	instead the cache grows beyond max_size and/or max_count.
 
-	local C = cache{key_t=,val_t=,size_t=int} create type from Lua
+	local C = cache{key_t=,val_t=,...}        create type from Lua
 	var c = cache(key_t,val_t,[size_t=int])   create value from Terra
 	c:init()                                  initialize (for struct members)
 	c:free()                                  free
@@ -33,7 +33,7 @@ if not ... then require'lrucache_test'; return end
 setfenv(1, require'low')
 require'linkedlist'
 
-local function cache_type(key_t, val_t, size_t, hash, equal)
+local function cache_type(key_t, val_t, size_t, context_t, hash, equal)
 
 	val_t = val_t or tuple()
 
@@ -43,14 +43,7 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 		refcount: size_t;
 	}
 
-	if cancall(key_t, 'free') or cancall(val_t, 'free') then
-		terra pair:free()
-			call(self.key, 'free')
-			call(self.val, 'free')
-		end
-	end
-
-	local pair_list = arraylinkedlist{T = pair}
+	local pair_list = arraylinkedlist{T = pair, context_t = context_t}
 
 	local deref = macro(function(self, i)
 		return `&self.state:link(@i).item.key
@@ -60,7 +53,9 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 		key_t = size_t,
 		hash = hash, equal = equal,
 		deref = deref, deref_key_t = key_t,
-		state_t = &pair_list;
+		state_t = &pair_list,
+		own_keys = false,
+		context_t = context_t,
 	}
 
 	local struct cache (gettersandsetters) {
@@ -77,129 +72,146 @@ local function cache_type(key_t, val_t, size_t, hash, equal)
 	cache.val_t = val_t
 	cache.size_t = size_t
 
-	local pair_memsize = macro(function(k, v)
-		return `sizeof(pair) + sizeof(size_t) + memsize(k) + memsize(v)
-	end)
+	addmethods(cache, function()
 
-	--storage
+		local pair_memsize = macro(function(k, v)
+			return `sizeof(pair) + sizeof(size_t) + memsize(k) + memsize(v)
+		end)
 
-	terra cache:init()
-		fill(self)
-		self.max_count = [size_t:max()]
-		self.pairs:init()
-		self.indices:init()
-		self.indices.state = &self.pairs
-		self.indices.noown_keys = true
-		self.first_active_index = -1
-	end
+		if cancall(key_t, 'free') or cancall(val_t, 'free') then
+			if context_t then
+				terra pair:free(context: context_t)
+					call(&self.key, 'free', 1, context)
+					call(&self.val, 'free', 1, context)
+				end
+			else
+				terra pair:free()
+					call(&self.key, 'free')
+					call(&self.val, 'free')
+				end
+			end
+		end
 
-	terra cache:clear()
-		self.pairs:clear()
-		self.indices:clear()
-		self.size = 0
-		self.count = 0
-		self.first_active_index = -1
-	end
+		--storage
 
-	terra cache:free()
-		self:clear()
-		self.pairs:free()
-		self.indices:free()
-	end
+		terra cache:init()
+			fill(self)
+			self.max_count = [size_t:max()]
+			self.pairs:init()
+			self.indices:init()
+			self.indices.state = &self.pairs
+			self.first_active_index = -1
+		end
 
-	terra cache:setcapacity(n: size_t)
-		return self.pairs:setcapacity(n)
-			and self.indices:resize(n)
-	end
-	terra cache:set_capacity(n: size_t)
-		self.pairs.capacity = n
-		self.indices.capacity = n
-	end
-	terra cache:set_min_capacity(n: size_t)
-		self.pairs.min_capacity = n
-		self.indices.min_capacity = n
-	end
+		terra cache:clear()
+			print([tostring(key_t)])
+			self.pairs:clear()
+			print'pairs cleared'
+			self.indices:clear()
+			self.size = 0
+			self.count = 0
+			self.first_active_index = -1
+		end
 
-	--operation
+		terra cache:free()
+			self:clear()
+			self.pairs:free()
+			self.indices:free()
+		end
 
-	cache.methods.pair = macro(function(self, i)
-		return `&self.pairs:link(i).item
-	end)
+		terra cache:setcapacity(n: size_t)
+			return self.pairs:setcapacity(n)
+				and self.indices:resize(n)
+		end
+		terra cache:set_capacity(n: size_t)
+			self.pairs.capacity = n
+			self.indices.capacity = n
+		end
+		terra cache:set_min_capacity(n: size_t)
+			self.pairs.min_capacity = n
+			self.indices.min_capacity = n
+		end
 
-	terra cache:get(k: key_t)
-		var ki = self.indices:index(k, -1)
-		if ki ~= -1 then
-			var i = self.indices:noderef_key_at_index(ki)
-			self.pairs:move_before(self.pairs.first, i)
-			var item = &self.pairs:link(i).item
-			inc(item.refcount)
+		--operation
+
+		cache.methods.pair = macro(function(self, i)
+			return `&self.pairs:link(i).item
+		end)
+
+		terra cache:get(k: key_t)
+			var ki = self.indices:index(k, -1)
+			if ki ~= -1 then
+				var i = self.indices:noderef_key_at_index(ki)
+				self.pairs:move_before(self.pairs.first, i)
+				var item = &self.pairs:link(i).item
+				inc(item.refcount)
+				if self.first_active_index == -1 then
+					self.first_active_index = i
+				end
+				return i, item
+			else
+				return -1, nil
+			end
+		end
+
+		terra cache:shrink(max_size: size_t, max_count: size_t)
+			while self.size > max_size or self.count > max_count do
+				var i = self.pairs.last
+				if i == -1 then break end --cache empty
+				var pair = &self.pairs:link(i).item
+				if pair.refcount > 0 then break end --can't shrink beyond this point
+				var pair_size = pair_memsize(pair.key, pair.val)
+				assert(self.indices:remove(pair.key))
+				self.pairs:remove(i)
+				self.size = self.size - pair_size
+				self.count = self.count - 1
+			end
+		end
+
+		terra cache:put(k: key_t, v: val_t)
+			var pair_size = pair_memsize(k, v)
+			self:shrink(self.max_size - pair_size, self.max_count - 1)
+			var i, link = self.pairs:insert_before(self.pairs.first)
+			link.item.key = k
+			link.item.val = v
+			link.item.refcount = 1
+			assert(self.indices:add(i) ~= -1) --fails if the key is present!
+			self.size = self.size + pair_size
+			self.count = self.count + 1
 			if self.first_active_index == -1 then
 				self.first_active_index = i
 			end
-			return i, item
-		else
-			return -1, nil
+			return i, &link.item
 		end
-	end
 
-	terra cache:shrink(max_size: size_t, max_count: size_t)
-		while self.size > max_size or self.count > max_count do
-			var i = self.pairs.last
-			if i == -1 then break end --cache empty
+		terra cache:forget(i: size_t)
 			var pair = &self.pairs:link(i).item
-			if pair.refcount > 0 then break end --can't shrink beyond this point
-			var pair_size = pair_memsize(pair.key, pair.val)
-			assert(self.indices:remove(pair.key))
-			call(pair.key, 'free')
-			call(pair.val, 'free')
-			self.pairs:remove(i)
-			self.size = self.size - pair_size
-			self.count = self.count - 1
-		end
-	end
-
-	terra cache:put(k: key_t, v: val_t)
-		var pair_size = pair_memsize(k, v)
-		self:shrink(self.max_size - pair_size, self.max_count - 1)
-		var i, link = self.pairs:insert_before(self.pairs.first)
-		link.item.key = k
-		link.item.val = v
-		link.item.refcount = 1
-		assert(self.indices:add(i) ~= -1) --fails if the key is present!
-		self.size = self.size + pair_size
-		self.count = self.count + 1
-		if self.first_active_index == -1 then
-			self.first_active_index = i
-		end
-		return i, &link.item
-	end
-
-	terra cache:forget(i: size_t)
-		var pair = &self.pairs:link(i).item
-		assert(pair.refcount > 0)
-		dec(pair.refcount)
-		if pair.refcount == 0 and self.first_active_index ~= -1 then
-			if self.first_active_index == i then
-				self.first_active_index = -1
-			else
-				self.pairs:move_after(self.first_active_index, i)
+			assert(pair.refcount > 0)
+			dec(pair.refcount)
+			if pair.refcount == 0 and self.first_active_index ~= -1 then
+				if self.first_active_index == i then
+					self.first_active_index = -1
+				else
+					self.pairs:move_after(self.first_active_index, i)
+				end
 			end
 		end
-	end
+
+	end)
 
 	return cache
 end
 cache_type = terralib.memoize(cache_type)
 
 local cache_type = function(key_t, val_t, size_t)
-	local hash, equal
+	local context_t, hash, equal
 	if terralib.type(key_t) == 'table' then
 		local t = key_t
 		key_t, val_t, size_t = t.key_t, t.val_t, t.size_t
-		hash, equal = t.hash, t.equal
+		context_t, hash, equal = t.context_t, t.hash, t.equal
 	end
 	size_t = size_t or int
-	return cache_type(key_t, val_t, size_t, hash, equal)
+	return cache_type(key_t, val_t, size_t, context_t, hash, equal)
 end
 
 low.lrucache = macro(
