@@ -94,19 +94,29 @@ local function cache_type(key_t, val_t, size_t, context_t, hash, equal)
 
 		--storage
 
-		terra cache:init()
-			fill(self)
-			self.max_count = [size_t:max()]
-			self.pairs:init()
-			self.indices:init()
-			self.indices.state = &self.pairs
-			self.first_active_index = -1
+		local init = macro(function(self, context)
+			return quote
+				fill(self)
+				self.max_count = [size_t:max()]
+				escape if context_t then emit quote
+					self.pairs:init(context)
+					self.indices:init(context)
+				end else emit quote
+					self.pairs:init()
+					self.indices:init()
+				end end end
+				self.indices.state = &self.pairs
+				self.first_active_index = -1
+			end
+		end)
+		if context_t then
+			terra cache:init(context: context_t) init(self, context) end
+		else
+			terra cache:init() init(self) end
 		end
 
 		terra cache:clear()
-			print([tostring(key_t)])
 			self.pairs:clear()
-			print'pairs cleared'
 			self.indices:clear()
 			self.size = 0
 			self.count = 0
@@ -210,8 +220,7 @@ local cache_type = function(key_t, val_t, size_t)
 		key_t, val_t, size_t = t.key_t, t.val_t, t.size_t
 		context_t, hash, equal = t.context_t, t.hash, t.equal
 	end
-	size_t = size_t or int
-	return cache_type(key_t, val_t, size_t, context_t, hash, equal)
+	return cache_type(key_t, val_t or nil, size_t or int, context_t or nil, hash, equal)
 end
 
 low.lrucache = macro(
