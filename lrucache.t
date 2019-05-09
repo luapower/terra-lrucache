@@ -49,7 +49,7 @@ local function cache_type(key_t, val_t, size_t, context_t, hash, equal)
 		return `&self.state:link(@i).item.key
 	end)
 
-	local indices_set = map{
+	local indices_set = set{
 		key_t = size_t,
 		hash = hash, equal = equal,
 		deref = deref, deref_key_t = key_t,
