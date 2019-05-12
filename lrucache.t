@@ -223,7 +223,7 @@ local cache_type = function(key_t, val_t, size_t)
 	return cache_type(key_t, val_t or nil, size_t or int, context_t or nil, hash, equal)
 end
 
-low.lrucache = macro(
+lrucache = macro(
 	--calling it from Terra returns a new cache object.
 	function(key_t, val_t, size_t)
 		local cache_type = cache_type(key_t, val_t, size_t)
@@ -233,3 +233,5 @@ low.lrucache = macro(
 	--just the type, and you can also pass a custom C namespace.
 	cache_type
 )
+
+return _M
